@@ -57,3 +57,24 @@ Items of interest:
 - How do we change the ACL based on that
 - Does Ryu allow splitting of packets as a default option?
 - Packet prioritization
+
+Need to see how to handle ARP properly first,
+Need to make sure that h1 and h2 can know of eachother
+
+Prioritise ARP and make sure it doesnt get rebroadcast unless its an arp reply.
+
+
+
+NEW:
+- WE will do proactive discovery to setup all the ACLs, first LLDP needs to be done, to find adjacent items, so we can set up a neighbour graph.
+- Then we put all hosts & services
+
+Steps to implement:
+- Network Device discovery: set up links and store the topology
+- ARP flood prevention: Check for any loops and turn it into a tree in the ACL, so anything can be reached from anywhere but there shall be no loops
+- ARP Host discovery: Upon learning of a host, set up the ACL flow to allow communication, make sure there is no way for loops, though i doubt that should happen, as long as we dont send it back to the place it came from previously
+- Packet simulation script: I need a script that will try and max out the link usage.
+- Load balancing: Maximising the links usage should be done, at the moment the max of one set of links is .1Mbps, with both set of paths enabled max throughput should be .2Mbps
+- Link down recovery: I need to make sure the Controller will dynamically sort out the ACLs for when a link is down, Throughput will tank a hit but is inevitable
+
+Broadcast is determined by the mac address FF:FF:FF:FF:FF:FF, so will check for any spanning tree and set specific rule for that mac address in acl, send to other ports on one switch and drop on rest while making sure all the switches get it
