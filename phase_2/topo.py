@@ -12,9 +12,7 @@ class MyTopo ( Topo ) :
   def build( self ):
     # Add Hosts
     h1 = self.addHost( 'h1', ip='10.0.0.1/24' )
-    h2 = self.addHost( 'h2', ip='10.0.0.2/24' )
-    h3 = self.addHost( 'h3', ip='10.0.0.3/24' )
-    h4 = self.addHost( 'h4', ip='10.0.0.4/24' )
+    h2 = self.addHost( 'h4', ip='10.0.0.2/24' )
 
     # Add Switches
     s1 = self.addSwitch('s1', dpid="1")
@@ -22,21 +20,22 @@ class MyTopo ( Topo ) :
     s3 = self.addSwitch('s3', dpid="3")
     s4 = self.addSwitch('s4', dpid="4")
 
-    # Add switch links
+    # Add switch links with bandwidth limits
     # Layer 1 to 2
-    self.addLink(s1, s2)
-    self.addLink(s1, s3)
+    self.addLink(s1, s2, bw=0.1)
+    self.addLink(s1, s3, bw=0.1)
     # Layer 2
-    self.addLink(s2, s3)
-    self.addLink(s2, s4)
+    self.addLink(s2, s3, bw=0.2)
     # Layer 2 to 3
-    self.addLink(s3, s4)
+    self.addLink(s2, s4, bw=0.1)
+    self.addLink(s3, s4, bw=0.1)
 
     # Add Switch / Host links
     self.addLink(s1, h1)
-    self.addLink(s2, h2)
-    self.addLink(s3, h3)
-    self.addLink(s4, h4)
+    self.addLink(s4, h2)
+
+    # Hosts 2 & 3 should theoretically be able to have 750Kbps throughput
+    # H1 & h4 should only be able to handle 500Kbps throughput total
 
 
 topos = { 'mytopo': ( lambda: MyTopo() ) }
