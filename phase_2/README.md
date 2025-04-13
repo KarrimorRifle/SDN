@@ -76,5 +76,6 @@ Steps to implement:
 - Packet simulation script: I need a script that will try and max out the link usage.
 - Load balancing: Maximising the links usage should be done, at the moment the max of one set of links is .1Mbps, with both set of paths enabled max throughput should be .2Mbps
 - Link down recovery: I need to make sure the Controller will dynamically sort out the ACLs for when a link is down, Throughput will tank a hit but is inevitable
+- Switch down recovery
 
 Broadcast is determined by the mac address FF:FF:FF:FF:FF:FF, so will check for any spanning tree and set specific rule for that mac address in acl, send to other ports on one switch and drop on rest while making sure all the switches get it
