@@ -2,9 +2,9 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
+from ryu.ofproto import ofproto_v1_3, ether
 from ryu.lib.packet import packet, ethernet, lldp
-from typing import List, Dict, Optional
+from typing import Dict
 
 """
 # Handler for packet-in events: process the incoming packet.
@@ -47,10 +47,10 @@ class SimpleSwitch(app_manager.RyuApp):
     self.DPID_block_port = {}
     # Store the datapaths
     self.datapaths = {}
+    self.expected_switches = 4
 
   @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
   def switch_features_handler(self, ev: ofp_event.EventOFPSwitchFeatures) -> None:
-    state = ev.state
     msg = ev.msg # has .body
     datapath = msg.datapath
     dpid = datapath.id
@@ -58,20 +58,19 @@ class SimpleSwitch(app_manager.RyuApp):
     parser = datapath.ofproto_parser
     ofproto = datapath.ofproto
 
-    self.logget.info("Switch %s connected", dpid)
+    self.logger.info("Switch %s connected", dpid)
 
     # Add network device
     self.datapaths[dpid] = datapath
+    if dpid not in self.DPID_to_port:
+      self.DPID_to_port = {}
+      self.DPID_block_port = {}
 
     # Add LLDP handling rule (send back to controller)
     match_lldp = parser.OFPMatch(eth_type=0x88CC)
     actions_lldp = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                       ofproto.OFPCML_NO_BUFFER)]
     self.add_flow(datapath, priority=100, match=match_lldp, actions=actions_lldp)
-
-    # Ask for port description
-    req = parser.OFPortDescStatsRequest(datapath, 0)
-    datapath.send_msg(req)
 
     # Add table miss rule
     parser = datapath.ofproto_parser
@@ -80,6 +79,12 @@ class SimpleSwitch(app_manager.RyuApp):
     actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                       ofproto.OFPCML_NO_BUFFER)]
     self.add_flow(datapath, 0, match, actions)
+
+    if len(self.datapaths.keys()) == self.expected_switches:
+      for datapath in self.datapaths.values():
+        # Ask for port description
+        req = parser.OFPPortDescStatsRequest(datapath)
+        datapath.send_msg(req)
 
   # Port description handler
   @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
@@ -120,11 +125,14 @@ class SimpleSwitch(app_manager.RyuApp):
               # This should be the chassis_id you set when sending the LLDP packet.
               # In your sending function, you probably set:
               # chassis_id = str(datapath.id)
-              neighbor_dpid_str = tlv.id_
+              if isinstance(tlv.chassis_id, bytes):
+                  neighbor_dpid_str = tlv.chassis_id.decode('utf-8')
+              else:
+                  neighbor_dpid_str = str(tlv.chassis_id)
               try:
                   neighbor_dpid = int(neighbor_dpid_str)
               except ValueError:
-                  self.logger.error("Received invalid chassis ID: %s", neighbor_dpid_str)
+                  self.logger.error("Invalid chassis ID: %s", neighbor_dpid_str)
               break
 
       if neighbor_dpid is not None:
@@ -140,10 +148,8 @@ class SimpleSwitch(app_manager.RyuApp):
           self.handle_broadcast_loops()
       return
 
-
-    # Check current DPID_to_port w/ DPID_block_port to see if there are any loops
-
-      # If loop add acl rule for broadcasting destination to not use that port
+    if eth_pkt.ethertype == 0x0806:
+      self.logger.info("ARP packet received on port %s", in_port)
 
 
   # Utility function to add flows to a switch.
@@ -190,6 +196,10 @@ class SimpleSwitch(app_manager.RyuApp):
 
   def recursive_bfs_travel(self, dpid, prev_dpid, traversed_dpids):
     to_traverse = []
+    # self.logger.info("Current keys available: " + str(self.DPID_to_port.keys()))
+    if dpid not in self.DPID_to_port:
+        self.logger.info("Switch %s not registered yet, skipping...", dpid)
+        return
     # Add all of the ones attatched to the DPID to traveresed_DPIDs except the previour ones
     for port in self.DPID_to_port[dpid].keys():
       # First, check if this port is already blocked for broadcast.
@@ -214,7 +224,7 @@ class SimpleSwitch(app_manager.RyuApp):
         self.add_flow(datapath, 110, match, actions) # Add flow
 
         # Add blocker to the tracked list
-        if not self.DPID_block_port[dpid]:
+        if dpid not in self.DPID_block_port:
           self.DPID_block_port[dpid] = []
         self.DPID_block_port[dpid].append(port)
 
@@ -251,8 +261,8 @@ class SimpleSwitch(app_manager.RyuApp):
           ofproto = datapath.ofproto
           
           # Create LLDP TLVs for chassis ID, port ID, and TTL
-          chassis_tlv = lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED, id_=str(chassis_id))
-          port_tlv = lldp.PortID(subtype=lldp.PortID.SUB_LOCALLY_ASSIGNED, id_=str(port_id))
+          chassis_tlv = lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED, chassis_id=str(chassis_id).encode('utf-8'))
+          port_tlv = lldp.PortID(subtype=lldp.PortID.SUB_LOCALLY_ASSIGNED, port_id=str(port_id).encode('utf-8'))
           ttl_tlv = lldp.TTL(ttl=120)  # Typical TTL in seconds
           lldp_pkt = lldp.lldp(tlvs=[chassis_tlv, port_tlv, ttl_tlv])
           
