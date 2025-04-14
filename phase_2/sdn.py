@@ -5,6 +5,7 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3, ether
 from ryu.lib.packet import packet, ethernet, lldp
 from typing import Dict
+from dataclasses import dataclass
 
 """
 # Handler for packet-in events: process the incoming packet.
@@ -16,11 +17,22 @@ def _packet_in_handler(self, ev):
 def switch_features_handler(self, ev):
 """
 
-# TODO
-# Review current script plan and make sure it:
-# Done - Handles LLDP packets
-# Done - Creates Spanning Tree for broadcasts
-# - Adjusts ACLs as soon as we get any packet from any kind of host
+"""
+TODO
+Review current script plan and make sure it:
+Done - Handles LLDP packets
+Done - Creates Spanning Tree for broadcasts
+Done - Allow broadcasting
+Done, but need fixing - Adjusts ACLs as soon as we get any packet from any kind of host
+Need to fix up the port blocking algo
+- sort load balancing to maximise throughput
+- Handle edges / switches failing
+"""
+
+@dataclass
+class HostPos:
+   dpid: int
+   dpid_port: int
 
 class SimpleSwitch(app_manager.RyuApp):
   # Specify the OpenFlow version; here we use 1.3.
@@ -47,8 +59,10 @@ class SimpleSwitch(app_manager.RyuApp):
     self.DPID_block_port = {}
     # Store the datapaths
     self.datapaths = {}
+    self.host_to_dpid: Dict[str, HostPos] = {}
     self.expected_switches = 4
 
+  # Config dispatch handler
   @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
   def switch_features_handler(self, ev: ofp_event.EventOFPSwitchFeatures) -> None:
     msg = ev.msg # has .body
@@ -63,8 +77,8 @@ class SimpleSwitch(app_manager.RyuApp):
     # Add network device
     self.datapaths[dpid] = datapath
     if dpid not in self.DPID_to_port:
-      self.DPID_to_port = {}
-      self.DPID_block_port = {}
+      self.DPID_to_port[dpid] = {}
+      self.DPID_block_port[dpid] = []
 
     # Add LLDP handling rule (send back to controller)
     match_lldp = parser.OFPMatch(eth_type=0x88CC)
@@ -72,9 +86,16 @@ class SimpleSwitch(app_manager.RyuApp):
                                       ofproto.OFPCML_NO_BUFFER)]
     self.add_flow(datapath, priority=100, match=match_lldp, actions=actions_lldp)
 
-    # Add table miss rule
-    parser = datapath.ofproto_parser
-    ofproto = datapath.ofproto
+    # Add ARP broadcast propogation: Also send it to the controller
+    match_broadcast = parser.OFPMatch(eth_dst='ff:ff:ff:ff:ff:ff', eth_type=0x0806)
+    actions_broadcast = [
+                          parser.OFPActionOutput(ofproto.OFPP_FLOOD, 0),
+                          parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                            ofproto.OFPCML_NO_BUFFER)
+                        ]
+    self.add_flow(datapath, 10, match_broadcast, actions_broadcast)
+
+    # # Add table miss rule
     match = parser.OFPMatch()
     actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                       ofproto.OFPCML_NO_BUFFER)]
@@ -149,8 +170,58 @@ class SimpleSwitch(app_manager.RyuApp):
       return
 
     if eth_pkt.ethertype == 0x0806:
-      self.logger.info("ARP packet received on port %s", in_port)
+      self.logger.info("ARP packet received on port %s on switch %s", in_port, datapath.id)
+      # Grab the sender's MAC address
+      src_mac = eth_pkt.src
+      # Add to the Mac addresses:
+      if src_mac not in self.host_to_dpid:
+        # Add where it came from
+        self.host_to_dpid[src_mac] = HostPos(dpid=None, dpid_port=None)
+      if self.host_to_dpid[src_mac].dpid != datapath.id:
+        self.host_to_dpid[src_mac].dpid = datapath.id
+        self.host_to_dpid[src_mac].dpid_port = in_port
+        self.create_paths_to_host(src_mac)
 
+  # Utility function to add paths to a host
+  def create_paths_to_host(self, src_mac, dpid=None, prev_dpid=None, traversed=None):
+    if dpid == None:
+      dpid = self.host_to_dpid[src_mac].dpid
+      traversed = [dpid]
+    
+    datapath = self.datapaths[dpid]
+    parser = datapath.ofproto_parser
+    ofproto = datapath.ofproto
+
+    match = None
+    action = None
+
+    ports_dict = self.DPID_to_port.get(dpid, {})
+
+    # Add ACL
+    if prev_dpid == None:
+      port = self.host_to_dpid[src_mac].dpid_port
+      match = parser.OFPMatch(eth_dst=src_mac)
+      action = [parser.OFPActionOutput(port)]
+    else:
+      port = None
+      for port_, nbr in ports_dict.items():
+        if nbr == prev_dpid:
+          port = port_
+      match = parser.OFPMatch(eth_dst=src_mac)
+      action = [parser.OFPActionOutput(port)]
+    
+    self.add_flow(datapath, priority=100, match=match, actions=action)
+
+    # Traverse BFS calling function
+    to_traverse = []
+    for port, nbr in ports_dict.items():
+      if nbr not in traversed:
+        traversed.append(nbr)
+        to_traverse.append(nbr)
+    for item in to_traverse:
+       self.create_paths_to_host(src_mac, nbr, dpid, traversed)
+
+    
 
   # Utility function to add flows to a switch.
   def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -193,6 +264,7 @@ class SimpleSwitch(app_manager.RyuApp):
 
     # Travel
     self.recursive_bfs_travel(dpid_start, None, traversed_dpids)
+    print(str(self.DPID_block_port))
 
   def recursive_bfs_travel(self, dpid, prev_dpid, traversed_dpids):
     to_traverse = []
