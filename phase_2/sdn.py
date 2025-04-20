@@ -6,6 +6,7 @@ from ryu.ofproto import ofproto_v1_3, ether
 from ryu.lib.packet import packet, ethernet, lldp
 from typing import Dict
 from dataclasses import dataclass
+from ryu.lib import hub
 
 """
 # Handler for packet-in events: process the incoming packet.
@@ -24,7 +25,9 @@ Done - Handles LLDP packets
 Done - Creates Spanning Tree for broadcasts
 Done - Allow broadcasting
 Done, but need fixing - Adjusts ACLs as soon as we get any packet from any kind of host
-Need to fix up the port blocking algo
+  Fixes:
+  - Port blocking sometimes blocks all three ports, GPT is assessing the the predecessor wasnt being accounted for, or which port it traveled through
+  - Race conditions, the writing of ACLs, in create_paths_to_host seems to work, but it seems to break after a few pings, make this handle race conditions
 - sort load balancing to maximise throughput
 - Handle edges / switches failing
 """
@@ -61,6 +64,9 @@ class SimpleSwitch(app_manager.RyuApp):
     self.datapaths = {}
     self.host_to_dpid: Dict[str, HostPos] = {}
     self.expected_switches = 4
+    # Mac locks
+    self._mac_in_progress = set()
+    self._map_lock = hub.Semaphore()
 
   # Config dispatch handler
   @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -170,17 +176,26 @@ class SimpleSwitch(app_manager.RyuApp):
       return
 
     if eth_pkt.ethertype == 0x0806:
-      self.logger.info("ARP packet received on port %s on switch %s", in_port, datapath.id)
+      self.logger.info("%s: ARP packet:\n  port: %s\n  to: %s\n  from:%s", datapath.id, in_port, eth_pkt.src, eth_pkt.dst)
       # Grab the sender's MAC address
       src_mac = eth_pkt.src
       # Add to the Mac addresses:
       if src_mac not in self.host_to_dpid:
         # Add where it came from
         self.host_to_dpid[src_mac] = HostPos(dpid=None, dpid_port=None)
-      if self.host_to_dpid[src_mac].dpid != datapath.id:
-        self.host_to_dpid[src_mac].dpid = datapath.id
-        self.host_to_dpid[src_mac].dpid_port = in_port
-        self.create_paths_to_host(src_mac)
+        print("Logging host")
+      if self.host_to_dpid[src_mac].dpid != None or self.host_to_dpid[src_mac].dpid != int(datapath.id):
+        print("Handling host")
+        with self._map_lock:
+            if src_mac in self._mac_in_progress:
+              return
+            self._mac_in_progress.add(src_mac)
+        try:
+          self.host_to_dpid[src_mac].dpid = datapath.id
+          self.host_to_dpid[src_mac].dpid_port = in_port
+          self.create_paths_to_host(src_mac)
+        finally:
+          hub.spawn_after(5, self._mac_in_progress.discard, src_mac)
 
   # Utility function to add paths to a host
   def create_paths_to_host(self, src_mac, dpid=None, prev_dpid=None, traversed=None):
@@ -219,7 +234,7 @@ class SimpleSwitch(app_manager.RyuApp):
         traversed.append(nbr)
         to_traverse.append(nbr)
     for item in to_traverse:
-       self.create_paths_to_host(src_mac, nbr, dpid, traversed)
+      self.create_paths_to_host(src_mac, item, dpid, traversed)
 
     
 
@@ -276,7 +291,7 @@ class SimpleSwitch(app_manager.RyuApp):
     for port in self.DPID_to_port[dpid].keys():
       # First, check if this port is already blocked for broadcast.
       if dpid in self.DPID_block_port and port in self.DPID_block_port[dpid]:
-          continue
+        continue
 
       # Grab the DPID attatched to the port
       dpid_on_port = self.DPID_to_port[dpid][port]
@@ -328,30 +343,30 @@ class SimpleSwitch(app_manager.RyuApp):
   """
   # Utility function to send LLDP packet to every Port
   def send_lldp_packet(self, datapath, port, chassis_id, port_id):
-          # Build an LLDP packet
-          parser = datapath.ofproto_parser
-          ofproto = datapath.ofproto
-          
-          # Create LLDP TLVs for chassis ID, port ID, and TTL
-          chassis_tlv = lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED, chassis_id=str(chassis_id).encode('utf-8'))
-          port_tlv = lldp.PortID(subtype=lldp.PortID.SUB_LOCALLY_ASSIGNED, port_id=str(port_id).encode('utf-8'))
-          ttl_tlv = lldp.TTL(ttl=120)  # Typical TTL in seconds
-          lldp_pkt = lldp.lldp(tlvs=[chassis_tlv, port_tlv, ttl_tlv])
-          
-          # Create Ethernet header with LLDP multicast destination
-          eth_pkt = ethernet.ethernet(dst='01:80:C2:00:00:0E',
-                                      src='00:00:00:00:00:01',  # Replace with appropriate source MAC
-                                      ethertype=ether.ETH_TYPE_LLDP)
-                                      
-          pkt = packet.Packet()
-          pkt.add_protocol(eth_pkt)
-          pkt.add_protocol(lldp_pkt)
-          pkt.serialize()
-          
-          actions = [parser.OFPActionOutput(port)]
-          out = parser.OFPPacketOut(datapath=datapath,
-                                    buffer_id=ofproto.OFP_NO_BUFFER,
-                                    in_port=ofproto.OFPP_CONTROLLER,
-                                    actions=actions,
-                                    data=pkt.data)
-          datapath.send_msg(out)
+    # Build an LLDP packet
+    parser = datapath.ofproto_parser
+    ofproto = datapath.ofproto
+    
+    # Create LLDP TLVs for chassis ID, port ID, and TTL
+    chassis_tlv = lldp.ChassisID(subtype=lldp.ChassisID.SUB_LOCALLY_ASSIGNED, chassis_id=str(chassis_id).encode('utf-8'))
+    port_tlv = lldp.PortID(subtype=lldp.PortID.SUB_LOCALLY_ASSIGNED, port_id=str(port_id).encode('utf-8'))
+    ttl_tlv = lldp.TTL(ttl=120)  # Typical TTL in seconds
+    lldp_pkt = lldp.lldp(tlvs=[chassis_tlv, port_tlv, ttl_tlv])
+    
+    # Create Ethernet header with LLDP multicast destination
+    eth_pkt = ethernet.ethernet(dst='01:80:C2:00:00:0E',
+                                src='00:00:00:00:00:01',  # Replace with appropriate source MAC
+                                ethertype=ether.ETH_TYPE_LLDP)
+                                
+    pkt = packet.Packet()
+    pkt.add_protocol(eth_pkt)
+    pkt.add_protocol(lldp_pkt)
+    pkt.serialize()
+    
+    actions = [parser.OFPActionOutput(port)]
+    out = parser.OFPPacketOut(datapath=datapath,
+                              buffer_id=ofproto.OFP_NO_BUFFER,
+                              in_port=ofproto.OFPP_CONTROLLER,
+                              actions=actions,
+                              data=pkt.data)
+    datapath.send_msg(out)
