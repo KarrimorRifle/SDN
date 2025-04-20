@@ -7,6 +7,7 @@ from ryu.lib.packet import packet, ethernet, lldp
 from typing import Dict
 from dataclasses import dataclass
 from ryu.lib import hub
+from collections import deque, defaultdict
 
 """
 # Handler for packet-in events: process the incoming packet.
@@ -28,6 +29,7 @@ Done, but need fixing - Adjusts ACLs as soon as we get any packet from any kind 
   Fixes:
   - Port blocking sometimes blocks all three ports, GPT is assessing the the predecessor wasnt being accounted for, or which port it traveled through
   - Race conditions, the writing of ACLs, in create_paths_to_host seems to work, but it seems to break after a few pings, make this handle race conditions
+  - Need to
 - sort load balancing to maximise throughput
 - Handle edges / switches failing
 """
@@ -183,13 +185,13 @@ class SimpleSwitch(app_manager.RyuApp):
       if src_mac not in self.host_to_dpid:
         # Add where it came from
         self.host_to_dpid[src_mac] = HostPos(dpid=None, dpid_port=None)
-        print("Logging host")
+        # print("Logging host")
       if self.host_to_dpid[src_mac].dpid != None or self.host_to_dpid[src_mac].dpid != int(datapath.id):
-        print("Handling host")
         with self._map_lock:
             if src_mac in self._mac_in_progress:
               return
             self._mac_in_progress.add(src_mac)
+            print("Handling host")
         try:
           self.host_to_dpid[src_mac].dpid = datapath.id
           self.host_to_dpid[src_mac].dpid_port = in_port
@@ -266,63 +268,70 @@ class SimpleSwitch(app_manager.RyuApp):
       we should just do BFS to ensure broadcasting efficiency
   """
   def handle_broadcast_loops(self):
-    # Choose a point to start
-    # DPID traversed: DPID came from
-    traversed_dpids = {}
+    """Build a loop‑free spanning tree and install drop‑flows on
+    redundant links.  Guarantees **at least one** forwarding port per switch.
+    This is a true breadth‑first search that touches each switch once.
+    """
+    if not self.DPID_to_port:
+      return  # nothing to do
 
-    # Grab first DPID and travel
-    dpids = list(self.DPID_to_port.keys())
-    dpid_start = dpids[0]
+    # (Re)initialise state for this traversal
+    self.DPID_block_port = defaultdict(set)
+    root = next(iter(self.DPID_to_port))       # pick the first switch seen
 
-    # First one is left empty as origin
-    traversed_dpids[dpid_start] = {}
+    visited   = {root}
+    queue     = deque([root])                  # BFS frontier
+    link_seen = set()                          # frozenset({a, b}) tracks cables
 
-    # Travel
-    self.recursive_bfs_travel(dpid_start, None, traversed_dpids)
-    print(str(self.DPID_block_port))
+    while queue:
+      dpid = queue.popleft()
 
-  def recursive_bfs_travel(self, dpid, prev_dpid, traversed_dpids):
-    to_traverse = []
-    # self.logger.info("Current keys available: " + str(self.DPID_to_port.keys()))
-    if dpid not in self.DPID_to_port:
-        self.logger.info("Switch %s not registered yet, skipping...", dpid)
-        return
-    # Add all of the ones attatched to the DPID to traveresed_DPIDs except the previour ones
-    for port in self.DPID_to_port[dpid].keys():
-      # First, check if this port is already blocked for broadcast.
-      if dpid in self.DPID_block_port and port in self.DPID_block_port[dpid]:
+      # Skip switches that disappeared mid‑traversal
+      if dpid not in self.DPID_to_port:
         continue
 
-      # Grab the DPID attatched to the port
-      dpid_on_port = self.DPID_to_port[dpid][port]
+      for port, nbr in self.DPID_to_port[dpid].items():
+        # Ignore ports we’ve already blocked in an earlier run
+        if port in self.DPID_block_port[dpid]:
+          continue
 
-      # If DPID == prev_dpid: continue
-      if dpid_on_port == prev_dpid:
-        continue
+        # Treat parallel links as duplicates
+        link_id = frozenset((dpid, nbr))
+        if link_id in link_seen:
+          self._maybe_block_port(dpid, port)
+          continue
+        link_seen.add(link_id)
 
-      # then If DPID in traversed_dpids: Edit flows to ignore receiving broadcast from the port
-      if dpid_on_port in traversed_dpids.keys():
-        datapath = self.datapaths[dpid]
-        parser = datapath.ofproto_parser
+        # Cross‑edge → would form a cycle → block current port
+        if nbr in visited:
+          self._maybe_block_port(dpid, port)
+          continue
 
-        # Make match detecting a ff:ff:ff:ff:ff:ff broadcast coming from "port"
-        match = parser.OFPMatch(in_port=port, eth_dst="FF:FF:FF:FF:FF:FF")
-        actions = [] # We want to drop the broadcast packet from this port specifically
-        self.add_flow(datapath, 110, match, actions) # Add flow
+        # First time we see this neighbour → keep the port & explore later
+        visited.add(nbr)
+        queue.append(nbr)
 
-        # Add blocker to the tracked list
-        if dpid not in self.DPID_block_port:
-          self.DPID_block_port[dpid] = []
-        self.DPID_block_port[dpid].append(port)
+    self.logger.info("Broadcast‑loop protection done; blocked ports: %s",
+                     dict(self.DPID_block_port))
 
-        continue
 
-      # else: add DPID to "to_traverse" list & add to "traversed_dpids" 
-      to_traverse.append(dpid_on_port)
-      traversed_dpids[dpid_on_port] = dpid
-    
-    for item in to_traverse:
-      self.recursive_bfs_travel(item, dpid, traversed_dpids)
+  def _maybe_block_port(self, dpid, port):
+    """Install a drop‑flow for ff:ff:ff:ff:ff:ff on (dpid, port) unless doing
+    so would isolate the switch (i.e. leave zero forwarding interfaces)."""
+    # How many ports would remain forwarding if we blocked this one?
+    total_ports     = len(self.DPID_to_port.get(dpid, {}))
+    already_blocked = len(self.DPID_block_port[dpid])
+    if total_ports - already_blocked <= 1:
+      # Would isolate the switch – keep at least one uplink alive
+      return
+
+    datapath = self.datapaths[dpid]
+    parser   = datapath.ofproto_parser
+    match    = parser.OFPMatch(in_port=port, eth_dst='FF:FF:FF:FF:FF:FF')
+    self.add_flow(datapath, 110, match, [])        # drop broadcast on this port
+
+    self.DPID_block_port[dpid].add(port)
+    self.logger.debug("Blocked broadcast on DPID %s port %s", dpid, port)
      
 
   """LLDP packet
